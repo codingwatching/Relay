@@ -126,6 +126,8 @@ Creates a new room.
 }
 ```
 
+---
+
 ### `join` packet
 Joins a room.  
 
@@ -185,6 +187,8 @@ Joins a room.
 </tr>
 </table>
 
+---
+
 ### `leave` packet
 Indicates that a client has left a room. 
 
@@ -202,6 +206,8 @@ Indicates that a client has left a room.
     "index": 0
 }
 ```
+
+---
 
 ### `error` packet
 Indicates that an error occurred when either joining or creating a room.  
