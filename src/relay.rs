@@ -1,6 +1,6 @@
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::{future::join_all, stream::SplitSink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, vec};
 use tokio::{net::TcpStream, sync::Mutex, sync::RwLock};
 use tokio_tungstenite::{tungstenite::protocol::Message, WebSocketStream};
 use tungstenite::{
@@ -99,7 +99,7 @@ impl Server {
                     .status(StatusCode::BAD_REQUEST)
                     .body(None)
                     .unwrap();
-                
+            
                 return Err(response);
             };
 
@@ -135,7 +135,10 @@ impl Server {
             while let Some(message) = receiver.next().await {
                 match message {
                     Ok(message) => client.handle_message(&server, message).await,
-                    Err(error) => println!("Failed to read message: {}", error),
+                    Err(error) => {
+                        println!("Failed to read message: {}", error);
+                        break;
+                    }
                 }
             }
 
@@ -157,20 +160,20 @@ impl Client {
         }
     }
 
-    async fn send(&self, sender: &Sender, message: Message) {
+    async fn send(&self, sender: Sender, message: Message) {
         let mut sender = sender.lock().await;
         if let Err(error) = sender.send(message).await {
             println!("Failed to send: {}", error);
         }
     }
 
-    async fn send_packet(&self, sender: &Sender, packet: ResponsePacket) {
+    async fn send_packet(&self, sender: Sender, packet: ResponsePacket) {
         let serialized_packet = serde_json::to_string(&packet).unwrap();
 
         self.send(sender, Message::Text(serialized_packet)).await;
     }
 
-    async fn send_error_packet(&self, sender: &Sender, message: String) {
+    async fn send_error_packet(&self, sender: Sender, message: String) {
         let error_packet = ResponsePacket::Error { message };
 
         self.send_packet(sender, error_packet).await
@@ -189,16 +192,23 @@ impl Client {
 
         let size = size_option.unwrap_or(Room::DEFAULT_ROOM_SIZE);
         if size == Room::MIN_ROOM_SIZE || size >= Room::MAX_ROOM_SIZE {
+            drop(server);
+
             return self
-                .send_error_packet(&self.sender, "The room size is not valid".to_string())
+                .send_error_packet(
+                    self.sender.clone(),
+                    "The room size is not valid".to_string(),
+                )
                 .await;
         }
 
         let room_id = Uuid::new_v4().to_string();
         if server.rooms.contains_key(&room_id) {
+            drop(server);
+
             return self
                 .send_error_packet(
-                    &self.sender,
+                    self.sender.clone(),
                     "A room with that identifier already exists.".to_string(),
                 )
                 .await;
@@ -208,9 +218,11 @@ impl Client {
         room.senders.push(self.sender.clone());
 
         server.rooms.insert(room_id.clone(), room);
-
         self.room_id = Some(room_id.clone());
-        self.send_packet(&self.sender, ResponsePacket::Create { id: room_id })
+
+        drop(server);
+
+        self.send_packet(self.sender.clone(), ResponsePacket::Create { id: room_id })
             .await
     }
 
@@ -226,43 +238,48 @@ impl Client {
         }
 
         let Some(room) = server.rooms.get_mut(&room_id) else {
-            return self.send_error_packet(&self.sender, "The room does not exist.".to_string()).await; 
+            drop(server);
+
+            return self.send_error_packet(self.sender.clone(), "The room does not exist.".to_string()).await; 
         };
 
         if room.senders.len() >= room.size {
+            drop(server);
+
             return self
-                .send_error_packet(&self.sender, "The room is full.".to_string())
+                .send_error_packet(self.sender.clone(), "The room is full.".to_string())
                 .await;
         }
 
         room.senders.push(self.sender.clone());
+        self.room_id = Some(room_id);
 
+        let mut futures = vec![];
         for sender in &room.senders {
             if Arc::ptr_eq(sender, &self.sender) {
-                self.send_packet(
-                    &sender,
+                futures.push(self.send_packet(
+                    sender.clone(),
                     ResponsePacket::Join {
                         size: Some(room.senders.len() - 1),
                     },
-                )
-                .await;
+                ));
             } else {
-                self.send_packet(&sender, ResponsePacket::Join { size: None })
-                    .await;
+                futures.push(self.send_packet(sender.clone(), ResponsePacket::Join { size: None }));
             }
         }
 
-        self.room_id = Some(room_id);
+        drop(server);
+        join_all(futures).await;
     }
 
     async fn handle_leave_room(&mut self, server: &RwLock<Server>) {
         let mut server = server.write().await;
 
-        let Some(room_id) = &self.room_id else {
+        let Some(room_id) = self.room_id.clone() else {
             return;
         };
 
-        let Some(room) = server.rooms.get_mut(room_id) else {
+        let Some(room) = server.rooms.get_mut(&room_id) else {
             return;
         };
 
@@ -271,17 +288,19 @@ impl Client {
         };
 
         room.senders.remove(index);
+        self.room_id = None;
 
+        let mut futures = vec![];
         for sender in &room.senders {
-            self.send_packet(&sender, ResponsePacket::Leave { index })
-                .await;
+            futures.push(self.send_packet(sender.clone(), ResponsePacket::Leave { index }));
         }
 
         if room.senders.is_empty() {
-            server.rooms.remove(room_id);
+            server.rooms.remove(&room_id);
         }
 
-        self.room_id = None;
+        drop(server);
+        join_all(futures).await;
     }
 
     async fn handle_message(&mut self, server: &RwLock<Server>, message: Message) {
@@ -294,11 +313,11 @@ impl Client {
                 return
             };
 
-            return match packet {
+            match packet {
                 RequestPacket::Create { size } => self.handle_create_room(server, size).await,
                 RequestPacket::Join { id } => self.handle_join_room(server, id).await,
                 RequestPacket::Leave => self.handle_leave_room(server).await,
-            };
+            }
         } else if message.is_binary() {
             let server = server.read().await;
 
@@ -325,17 +344,23 @@ impl Client {
             data[0] = source;
 
             if destination < room.senders.len() {
-                return self
-                    .send(&room.senders[destination], Message::Binary(data))
-                    .await;
+                let sender = room.senders[destination].clone();
+
+                drop(server);
+
+                return self.send(sender, Message::Binary(data)).await;
             } else if destination == usize::from(u8::MAX) {
+                let mut futures = vec![];
                 for sender in &room.senders {
                     if Arc::ptr_eq(sender, &self.sender) {
                         continue;
                     }
 
-                    self.send(&sender, Message::Binary(data.clone())).await;
+                    futures.push(self.send(sender.clone(), Message::Binary(data.clone())));
                 }
+
+                drop(server);
+                join_all(futures).await;
             }
         }
     }
